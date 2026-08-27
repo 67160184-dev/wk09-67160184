@@ -11,6 +11,9 @@ const pool = require("./db");
 const schema = require("./schema");
 const root = require("./resolvers");
 
+// นำเข้า Redis Cache
+const { redisClient, connectRedis } = require("./cache");
+
 // นำเข้า Helpers และ Middlewares สำหรับ Authentication & RBAC
 const {
   hashPassword,
@@ -18,6 +21,9 @@ const {
   generateToken,
 } = require("./auth-helpers");
 const { authenticateToken, authorizeRole } = require("./middlewares/auth");
+
+// นำเข้า Middleware สำหรับ Pagination และ Sorting (ส่วนที่ 3)
+const { parsePagination, parseSort } = require("./middlewares/query-parser");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -178,21 +184,70 @@ app.patch(
 );
 
 // ==========================================
-// REST Endpoints (Students & Courses - MySQL Database)
+// API v1 Router — Students & Courses
 // ==========================================
+const v1Router = express.Router();
 
-// GET: ดึงรายชื่อนักศึกษาทั้งหมด
-app.get("/api/v1/students", async (req, res, next) => {
-  try {
-    const [rows] = await pool.query("SELECT * FROM students");
-    res.status(200).json({ message: "สำเร็จ", data: rows });
-  } catch (err) {
-    next(err);
-  }
-});
+// GET: ดึงรายชื่อนักศึกษาทั้งหมด (พร้อม Cache, Pagination, Filtering, Sorting)
+v1Router.get(
+  "/students",
+  parsePagination,
+  parseSort,
+  async (req, res, next) => {
+    const { major } = req.query;
+    const { page, limit, offset } = req.pagination;
+    const { field, order } = req.sort;
+
+    // สร้าง cache key ที่ครอบคลุมพารามิเตอร์ทั้งหมด
+    const cacheKey = `students:p${page}:l${limit}:major${major || "all"}:sort${field}:${order}`;
+
+    try {
+      // ตรวจสอบ cache ก่อน
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        return res.status(200).json({
+          message: "สำเร็จ (จาก cache)",
+          ...JSON.parse(cached),
+        });
+      }
+
+      let baseQuery = "SELECT * FROM students";
+      let countQuery = "SELECT COUNT(*) AS total FROM students";
+      const params = [];
+
+      if (major) {
+        baseQuery += " WHERE major = ?";
+        countQuery += " WHERE major = ?";
+        params.push(major);
+      }
+
+      baseQuery += ` ORDER BY ${field} ${order} LIMIT ? OFFSET ?`;
+
+      const [rows] = await pool.query(baseQuery, [...params, limit, offset]);
+      const [[{ total }]] = await pool.query(countQuery, params);
+
+      const payload = {
+        data: rows,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      };
+
+      // บันทึกลง cache พร้อม TTL 60 วินาที
+      await redisClient.set(cacheKey, JSON.stringify(payload), { EX: 60 });
+
+      res.status(200).json({ message: "สำเร็จ (จากฐานข้อมูล)", ...payload });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // GET: ดึงข้อมูลนักศึกษารายบุคคล
-app.get("/api/v1/students/:id", async (req, res, next) => {
+v1Router.get("/students/:id", async (req, res, next) => {
   try {
     const [rows] = await pool.query("SELECT * FROM students WHERE id = ?", [
       req.params.id,
@@ -210,8 +265,8 @@ app.get("/api/v1/students/:id", async (req, res, next) => {
   }
 });
 
-// POST: เพิ่มข้อมูลนักศึกษาใหม่
-app.post("/api/v1/students", async (req, res, next) => {
+// POST: เพิ่มข้อมูลนักศึกษาใหม่ (พร้อมล้าง Cache)
+v1Router.post("/students", async (req, res, next) => {
   const { name, major, email, user_id } = req.body;
 
   if (!name || !major || !email) {
@@ -225,6 +280,13 @@ app.post("/api/v1/students", async (req, res, next) => {
       "INSERT INTO students (name, major, email, user_id) VALUES (?, ?, ?, ?)",
       [name, major, email, user_id || null],
     );
+
+    // ล้าง cache ทั้งหมดที่เกี่ยวกับ students เนื่องจากข้อมูลเปลี่ยนแปลงแล้ว
+    const keys = await redisClient.keys("students:*");
+    if (keys.length > 0) {
+      await redisClient.del(keys);
+    }
+
     res.status(201).json({
       message: "เพิ่มข้อมูลสำเร็จ",
       data: { id: result.insertId, name, major, email, user_id: user_id || null },
@@ -239,9 +301,9 @@ app.post("/api/v1/students", async (req, res, next) => {
   }
 });
 
-// PUT: แก้ไขข้อมูลนักศึกษา (แบบฝึกหัดต่อยอดที่ 2: Object-level Authorization)
-app.put(
-  "/api/v1/students/:id",
+// PUT: แก้ไขข้อมูลนักศึกษา (Object-level Authorization)
+v1Router.put(
+  "/students/:id",
   authenticateToken,
   async (req, res, next) => {
     const studentId = req.params.id;
@@ -293,6 +355,12 @@ app.put(
         );
       }
 
+      // ล้าง cache หลังแก้ไขข้อมูล
+      const keys = await redisClient.keys("students:*");
+      if (keys.length > 0) {
+        await redisClient.del(keys);
+      }
+
       const [updatedRows] = await pool.query(
         "SELECT * FROM students WHERE id = ?",
         [studentId],
@@ -313,9 +381,9 @@ app.put(
   },
 );
 
-// DELETE: ลบข้อมูลนักศึกษา (ขั้นตอนที่ 2.6: RBAC เฉพาะ admin เท่านั้น)
-app.delete(
-  "/api/v1/students/:id",
+// DELETE: ลบข้อมูลนักศึกษา (เฉพาะ admin เท่านั้น)
+v1Router.delete(
+  "/students/:id",
   authenticateToken,
   authorizeRole("admin"),
   async (req, res, next) => {
@@ -328,6 +396,13 @@ app.delete(
           error: { code: "NOT_FOUND", message: "ไม่พบข้อมูลนิสิต" },
         });
       }
+
+      // ล้าง cache หลังลบข้อมูล
+      const keys = await redisClient.keys("students:*");
+      if (keys.length > 0) {
+        await redisClient.del(keys);
+      }
+
       res.status(200).json({ message: "ลบข้อมูลสำเร็จ" });
     } catch (err) {
       next(err);
@@ -336,7 +411,7 @@ app.delete(
 );
 
 // POST: ลงทะเบียนเรียน (พร้อม Transaction & Row Locking)
-app.post("/api/v1/students/:id/enrollments", async (req, res, next) => {
+v1Router.post("/students/:id/enrollments", async (req, res, next) => {
   const studentId = req.params.id;
   const { courseId } = req.body;
   const connection = await pool.getConnection();
@@ -395,7 +470,7 @@ app.post("/api/v1/students/:id/enrollments", async (req, res, next) => {
 });
 
 // GET: ดึงรายวิชาที่นักศึกษาลงทะเบียน (ใช้ JOIN)
-app.get("/api/v1/students/:id/courses", async (req, res, next) => {
+v1Router.get("/students/:id/courses", async (req, res, next) => {
   try {
     const [rows] = await pool.query(
       `SELECT courses.* FROM courses
@@ -410,8 +485,8 @@ app.get("/api/v1/students/:id/courses", async (req, res, next) => {
 });
 
 // DELETE: ยกเลิกการลงทะเบียนเรียน (ใช้ Transaction)
-app.delete(
-  "/api/v1/students/:id/enrollments/:courseId",
+v1Router.delete(
+  "/students/:id/enrollments/:courseId",
   async (req, res, next) => {
     const { id: studentId, courseId } = req.params;
     const connection = await pool.getConnection();
@@ -450,6 +525,28 @@ app.delete(
     }
   },
 );
+
+// เชื่อม v1Router กับ prefix /api/v1
+app.use("/api/v1", v1Router);
+
+// ==========================================
+// API v2 Router — ปรับโครงสร้าง response ใหม่ (Versioning)
+// ==========================================
+const v2Router = express.Router();
+
+// GET /api/v2/students — คืนค่าโครงสร้างใหม่ ไม่มี wrapper "message"
+v2Router.get("/students", async (req, res, next) => {
+  try {
+    const [rows] = await pool.query("SELECT * FROM students");
+    // v2 ปรับโครงสร้างผลลัพธ์ใหม่ ไม่มี wrapper "message" เหมือน v1
+    res.status(200).json({ items: rows, count: rows.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// เชื่อม v2Router กับ prefix /api/v2
+app.use("/api/v2", v2Router);
 
 // ==========================================
 // GraphQL Endpoint (จากสัปดาห์ที่ 2)
@@ -490,10 +587,12 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start Server
+// Start Server — เชื่อม Redis ก่อน จึงค่อย listen
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Server กำลังทำงานที่พอร์ต ${PORT} (${process.env.NODE_ENV})`);
+  connectRedis().then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server กำลังทำงานที่พอร์ต ${PORT} (${process.env.NODE_ENV})`);
+    });
   });
 }
 
