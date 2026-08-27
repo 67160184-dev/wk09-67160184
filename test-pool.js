@@ -17,6 +17,7 @@ async function runTest() {
     console.error("เกิดข้อผิดพลาดระหว่างทดสอบ:", err);
   } finally {
     await pool.end();
+
   }
 }
 
